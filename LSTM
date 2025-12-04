@@ -1,0 +1,188 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import r2_score, mean_absolute_error
+from keras.models import Sequential
+from keras.layers import Dense, LSTM, Dropout
+from keras.callbacks import EarlyStopping
+from keras.optimizers import Adam
+import warnings
+import os
+import time
+
+warnings.filterwarnings('ignore')
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+single_prediction_times = []
+
+def prepare_data():
+    data = pd.read_csv('price_prediction_dataset.csv')
+    data['date'] = pd.to_datetime(data['date'])
+    data = data.sort_values(['product', 'date'])
+
+    # Кодируем product
+    le = LabelEncoder()
+    data['product_encoded'] = le.fit_transform(data['product'])
+
+    # все признаки кроме цены
+    feature_cols = [
+        'product_encoded', 'sales', 'discount', 'advertising',
+        'stock_level', 'month', 'day_of_week', 'is_weekend',
+        'day_of_year', 'quarter'
+    ]
+
+    target_col = 'price'  # Целевая переменная - ЦЕНА
+
+    return data, feature_cols, target_col, le
+
+
+def create_sequences(data, feature_cols, target_col, sequence_length=15):
+    sequences = []
+    labels = []
+    original_labels = []
+
+    data = data.sort_values(['product_encoded', 'date'])
+    unique_products = data['product_encoded'].unique()
+
+    for product in unique_products:
+        product_data = data[data['product_encoded'] == product].sort_values('date')
+
+        if len(product_data) < sequence_length + 1:
+            continue
+
+        X_product = product_data[feature_cols].values
+        y_product = product_data[target_col].values
+
+        # Нормализация от 0 до 1
+        X_min, X_max = X_product.min(axis=0), X_product.max(axis=0)
+        y_min, y_max = y_product.min(), y_product.max()
+
+        X_normalized = (X_product - X_min) / (X_max - X_min + 1e-8)
+        y_normalized = (y_product - y_min) / (y_max - y_min + 1e-8)
+
+        for i in range(sequence_length, len(product_data)):
+            seq_features = X_normalized[i - sequence_length:i]
+            target_value = y_normalized[i]
+            original_value = y_product[i]
+
+            sequences.append(seq_features)
+            labels.append(target_value)
+            original_labels.append(original_value)
+
+    return np.array(sequences), np.array(labels), np.array(original_labels)
+
+
+
+data, feature_cols, target_col, label_encoder = prepare_data()
+
+data = data.sort_values(['product', 'date'])
+split_date = data['date'].quantile(0.8)
+train_data = data[data['date'] <= split_date]
+test_data = data[data['date'] > split_date]
+
+SEQ_LENGTH = 18
+train_seq, train_label, train_original = create_sequences(train_data, feature_cols, target_col, SEQ_LENGTH)
+test_seq, test_label, test_original = create_sequences(test_data, feature_cols, target_col, SEQ_LENGTH)
+
+model = Sequential([
+    LSTM(48, return_sequences=True, input_shape=(SEQ_LENGTH, len(feature_cols))),
+    Dropout(0.25),
+    LSTM(24, return_sequences=False),
+    Dropout(0.25),
+    Dense(12, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+optimizer = Adam(learning_rate=0.0005)
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=15,
+    restore_best_weights=True,
+    min_delta=0.001
+)
+
+model.compile(
+    loss='mse',
+    optimizer=optimizer,
+    metrics=['mae']
+)
+
+history = model.fit(
+    train_seq, train_label,
+    epochs=80,
+    batch_size=16,
+    validation_data=(test_seq, test_label),
+    callbacks=[early_stop],
+    verbose=1,
+    shuffle=False
+)
+
+test_pred_normalized = model.predict(test_seq).flatten()
+
+test_pred_original = test_pred_normalized * (test_original.max() - test_original.min()) + test_original.min()
+
+num_predictions = min(470, len(test_seq))
+indices = np.random.choice(len(test_seq), num_predictions, replace=False)
+
+for i in indices:
+    single_seq = test_seq[i:i + 1]
+
+    start_time = time.perf_counter()
+    pred = model.predict(single_seq, verbose=0)
+    end_time = time.perf_counter()
+
+    single_prediction_times.append((end_time - start_time) * 1000)
+
+# График времени предсказаний
+plt.figure(figsize=(10, 6))
+plt.hist(single_times_ms, bins=30, alpha=0.7, color='blue', edgecolor='black')
+plt.axvline(single_times_ms.mean(), color='red', linestyle='--',
+            label=f'Среднее: {single_times_ms.mean():.2f} мс')
+plt.xlabel('Время предсказания (мс)')
+plt.ylabel('Количество')
+plt.title('Распределение времени предсказания одной цены')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+min_len = min(len(test_pred_original), len(test_original))
+test_pred_original = test_pred_original[:min_len]
+test_original = test_original[:min_len]
+
+
+# 1. Сравнение цен
+plt.figure(figsize=(8, 6))
+plt.plot(test_original[:100], label='действительные цены', linewidth=2, alpha=0.8)
+plt.plot(test_pred_original[:100], label='Предсказанные цены', linewidth=1.5, alpha=0.8)
+plt.title('Сравнение действительных и предсказанных цен')
+plt.legend()
+
+# Ошибки цен
+plt.figure(figsize=(8, 6))
+errors = np.abs(test_original - test_pred_original)
+plt.hist(errors, bins=30, alpha=0.7, color='red', edgecolor='black')
+plt.axvline(errors.mean(), color='black', linestyle='--', label=f'Средняя ошибка: {errors.mean():.1f}')
+plt.title('Распределение ошибок цен')
+plt.legend()
+
+# Обучение
+plt.figure(figsize=(8, 6))
+plt.plot(history.history['loss'], label='Training Loss', linewidth=2)
+plt.plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+plt.title('Функция потерь')
+plt.legend()
+
+# Сравнение всех предсказаний
+plt.figure(figsize=(8, 6))
+plt.scatter(test_original, test_pred_original, alpha=0.6, s=20)
+plt.plot([80, 140], [80, 140], 'r--', alpha=0.8, linewidth=2)
+
+plt.xlim(80, 140)
+plt.ylim(80, 140)
+
+plt.xlabel('Действительные цены')
+plt.ylabel('Предсказанные цены')
+
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
